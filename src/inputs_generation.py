@@ -25,7 +25,7 @@ class Inputs:
 
     def display_inputs(self, N, WN_tau, h0):
         inputs = self.inputs(N, WN_tau, h0)
-        plt.figure(figsize=(8, 4))
+        plt.figure(figsize=(12, 4))
         plt.plot(inputs, color="#F9B522D7", linewidth=1.5)
         plt.axhline(inputs.mean(), color="gray", linestyle='--', label='mean')
         plt.xlabel('t')

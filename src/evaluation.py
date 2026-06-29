@@ -2,6 +2,12 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+def logit_to_rate(targets_logit):
+    """
+    Converts logit-space functions back to firing rates in [0,1].
+    """
+    return 1.0 / (1.0 + np.exp(-targets_logit))
+
 class Metrics:
     """
     Evaluation metrics from Rajan, Harvey & Tank (2016)
@@ -24,6 +30,7 @@ class Metrics:
         """
         bVar    = stereotypy of the neural sequence
                 = the amount of variability in the data explained by the bump
+        Computed in normalized-rate space.
         """
         norm_rates = Metrics.normalize(rates)
         N = norm_rates.shape[0]
@@ -41,9 +48,10 @@ class Metrics:
         return float(bVar)
 
     @staticmethod
-    def compute_pVar(targets, rates):
+    def compute_pVar(targets, rates, targets_are_logit=True):
         """
-        pVar = amount of variance of the data that is captured by the model
+        pVar = fraction of variance of the target captured by the model.
+        # Computed in rate space.
         """
         norm_rates = Metrics.normalize(rates)
         target_mean = targets.mean()
@@ -51,6 +59,14 @@ class Metrics:
         denom = np.mean ((targets - target_mean)**2)
         pVar = 1 - num / (denom + 1e-10)
         return float(pVar)
+        # target_rate = logit_to_rate(targets) if targets_are_logit else targets
+        # target_norm = Metrics.normalize(target_rate)
+        # model_norm = Metrics.normalize(rates)
+        # target_mean = targets.mean()
+        # num = np.mean((target_norm - model_norm)**2)
+        # denom = np.mean ((target_norm - model_norm.mean())**2)
+        # pVar = 1 - num / (denom + 1e-10)
+        # return float(pVar)
 
     @staticmethod
     def compute_Qeff(rates, threshold):
@@ -68,33 +84,20 @@ class Metrics:
         Qeff = int(np.searchsorted(cumvar, threshold)) + 1
         return Qeff
 
-    # @staticmethod
-    # def compute_NActive(rates, t, sigma):
-    #     """
-    #     NActive = fraction of neurons active at any moment
-    #     """
-    #     N = rates.shape[0]
-
-    
-    # @staticmethod
-    # def compute_selectivity():
-
-
     @staticmethod
     def general_evaluation(rates, targets, t, sigma, threshold):
         results = {
-            '': ["Model's metrics", "Article's metrics"],
+            '': ["Model's metrics", "Article's metrics for p=0.08"],
             'bVar': [Metrics.compute_bVar(rates, t, sigma), '1'],
-            'pVar': [Metrics.compute_pVar(targets, rates), '0.9'],
-            'Qeff': [Metrics.compute_Qeff(rates, threshold), 'trueval']#,
-            # 'NActive': [Metrics.compute_NActive, "truevao"]
+            'pVar': [Metrics.compute_pVar(targets, rates), '0.92'],
+            'Qeff': [Metrics.compute_Qeff(rates, threshold), '10']
         }
-        # then compute their selectivity and add it to the dictionnaire avec la valeur attendue
         result_df = pd.DataFrame(results)
         return result_df
     
     @staticmethod
     def network_output(rates, T, dt):
+        N = rates.shape[0]
         t = np.arange(0, T, dt)
         norm_rates = Metrics.normalize(rates)
         tCOM = Metrics.compute_tCOM(norm_rates, t)
