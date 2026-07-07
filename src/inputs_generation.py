@@ -12,14 +12,13 @@ class Inputs:
         
     def inputs(self, N, WN_tau, h0):
         """
-        Returns inputs of shape (N, T_steps)
+        Returns inputs of shape (N, T_steps).
         """
         inputs = np.zeros((N, self.T_steps))
         h = np.zeros(N)
         for i_t in range(self.T_steps):
             eta = np.random.randn(N) # maybe utiliser un meilleur générateur
-            dh = (-h + h0*eta) / WN_tau
-            h += self.dt*dh
+            h += self.dt * (-h / WN_tau) + h0 * np.sqrt(self.dt / WN_tau) * eta
             inputs[:, i_t] = h.copy()
         return inputs
 

@@ -18,6 +18,7 @@ class RNN:
         self.theta = theta
         self.p0 = p0
         self.J = np.random.normal(0, g/np.sqrt(N), (N,N)) # random connectivity matrix
+        self.J_init = self.J.copy()
         self.x = np.random.randn(N) * 0.1 # activation variable
         self.r = self.sigm(self.x) # firing rate
     
@@ -38,12 +39,12 @@ class RNN:
         return rates
 
 @njit(cache=True, fastmath=True)
-def _pin_train(J, P, x, plastic, theta, dt, tau, inputs, targets,
-                n_runs, cv_threshold, x_init_scale, p_reg=0.0):
+def _pin_train(J, P, x, plastic, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, p_reg):
     N = J.shape[0]
     pN = plastic.shape[0]
     T_steps = inputs.shape[1]
     errors = np.empty(n_runs, dtype=np.float64)
+    j_norms = np.empty(n_runs, dtype=np.float64)
 
     r = 1.0 / (1.0 + np.exp(-(x - theta)))
     z = np.empty(N, dtype=np.float64)
@@ -116,11 +117,18 @@ def _pin_train(J, P, x, plastic, theta, dt, tau, inputs, targets,
 
         run_error /= T_steps
         errors[run] = run_error
+
+        norm = 0.0
+        for i in range(N):
+            for j in range(N):
+                norm += J[i,j] * J[i,j]
+        j_norms[run] = norm ** 0.5
+
         if run_error < cv_threshold:
             n_done = run + 1
             break
 
-    return errors[:n_done]
+    return errors[:n_done], j_norms[:n_done]
     
     
 class PINning:
@@ -186,27 +194,86 @@ class PINning:
 
     def train(self, inputs, n_runs, cv_threshold, DEBUG=False, p_reg=1e-9):
         inputs = np.ascontiguousarray(inputs, dtype=np.float64)
+        self.inputs = inputs # kept so save() can persist the exact frozen input used
         targets = np.ascontiguousarray(self.targets, dtype=np.float64)
         self.rnn.J = np.ascontiguousarray(self.rnn.J, dtype=np.float64)
         self.P = np.ascontiguousarray(self.P, dtype=np.float64)
         x = np.ascontiguousarray(self.rnn.x, dtype=np.float64)
         plastic = np.ascontiguousarray(self.plastic_neurons, dtype=np.int64)
         
-        errors = _pin_train(self.rnn.J, self.P, x, plastic, float(self.rnn.theta), float(self.rnn.dt), float(self.rnn.tau), inputs, targets, int(n_runs), float(cv_threshold), 0.1, float(p_reg))
+        errors, j_norms = _pin_train(self.rnn.J, self.P, x, plastic, float(self.rnn.theta), float(self.rnn.dt), float(self.rnn.tau), inputs, targets, int(n_runs), float(cv_threshold), 0.1, float(p_reg))
         self.rnn.x = x
         self.rnn.r = self.rnn.sigm(self.rnn.x)
         errors = list(errors)
+        j_norms  = list(j_norms)
         
         for k in range(0, len(errors)):
+            delta_norm = j_norms[k] - (j_norms[k-1] if k > 0 else j_norms[0])
             if DEBUG:
-                print(f"Run {k+1} | run_error={errors[k]:.6f}")
+                print(f"Run {k+1} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f} | Δ||J||={delta_norm:+.2f}")
             if (k+1) % 50 == 0:
-                print(f"Run {k+1}/{n_runs}, run_error = {errors[k]:.4f}") # displays progression
+                print(f"Run {k+1}/{n_runs}, run_error = {errors[k]:.4f} | ||J||={j_norms[k]:.2f} | Δ||J||={delta_norm:+.2f}") # displays progression
         if len(errors) < n_runs:
-            print(f"Converged at run {len(errors)}, run_error = {errors[-1]:.4f}")
+            print(f"Converged at run {len(errors)}, run_error = {errors[-1]:.4f} | ||J||={j_norms[-1]:.2f}")
         
-        return errors
+        return errors, j_norms
     
+    def save(self, filepath):
+        """
+        Saves the model so its weigths can be used later without re-training.
+        """
+        np.savez(
+            filepath,
+            J=self.rnn.J,
+            J_init=self.rnn.J_init,
+            inputs=self.inputs,
+            targets=self.targets,
+            theta=self.rnn.theta,
+            dt=self.rnn.dt,
+            tau=self.rnn.tau,
+            N=self.rnn.N,
+            g=self.rnn.g,
+            p0=self.rnn.p0,
+            p=self.p,
+            P=self.P,
+            plastic_neurons=self.plastic_neurons,
+        )
+
+    @staticmethod
+    def load(filepath):
+        """
+        Reloads the model previously saved.
+        """
+        data = np.load(filepath)
+        rnn = RNN(
+            N=int(data['N']), g=float(data['g']), dt=float(data['dt']),
+            tau=float(data['tau']), theta=float(data['theta']), p0=float(data['p0']),
+        )
+        rnn.J = data['J']
+        rnn.J_init = data['J_init']
+        model = PINning(p=float(data['p']), rnn=rnn, targets=data['targets'], p0=float(data['p0']))
+        model.plastic_neurons = data['plastic_neurons']
+        model.P = data['P']
+        return model, data['inputs']
+
+    def display_weight_change(self):
+        """
+        Distribution of |J_trained - J_init|, restricted to the trainable (plastic) columns of J.
+        """
+        delta = self.rnn.J[:, self.plastic_neurons] - self.rnn.J_init[:, self.plastic_neurons]
+        delta = np.abs(delta.flatten())
+        delta = delta[delta > 0]
+        plt.figure(figsize=(8, 4))
+        plt.hist(delta, bins=100, color="#472A7A", log=True)
+        plt.xlabel('|ΔJ| (synaptic strength change)')
+        plt.ylabel('Count (log scale)')
+        plt.title('Distribution of synaptic strength changes (plastic synapses)')
+        plt.tight_layout()
+        plt.show()
+        ratio = delta.max() / np.median(delta)
+        print(f"max / median |ΔJ| ratio: {ratio:.1f} "
+              f"(paper reports ~20 for a sparsely PINned network)")
+
     def display_cv(self, errors):
         plt.figure(figsize=(8, 4))
         plt.plot(errors, color="#F9B522D7", linewidth=1.5)
@@ -217,7 +284,6 @@ class PINning:
         plt.legend()
         plt.tight_layout()
         plt.show()
-        # add the norm fo the weight update -> should decay towards 0
       
     def simulate(self, inputs, n_steps):
         all_rates = []

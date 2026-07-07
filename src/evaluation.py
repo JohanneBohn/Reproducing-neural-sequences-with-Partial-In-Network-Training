@@ -20,10 +20,12 @@ class Metrics:
     @staticmethod
     def compute_tCOM(rates, t):
         """
-        tCOM = time of center of mass -> computed for each neuron
+        tCOM = time of center of mass -> computed for each neuron (after substracting the per-neuron baseline activity).
         """
-        total = np.sum(rates, axis=1) + 1e-10
-        return np.sum(rates * t[None, :], axis=1) / total
+        baseline = np.min(rates, axis=1, keepdims=True)
+        rates_above_baseline = np.clip(rates - baseline, 0, None)
+        total = np.sum(rates_above_baseline, axis=1) + 1e-10
+        return np.sum(rates_above_baseline * t[None, :], axis=1) / total
     
     @staticmethod
     def compute_bVar(rates, t, sigma):
@@ -62,9 +64,9 @@ class Metrics:
         # target_rate = logit_to_rate(targets) if targets_are_logit else targets
         # target_norm = Metrics.normalize(target_rate)
         # model_norm = Metrics.normalize(rates)
-        # target_mean = targets.mean()
+        # target_mean = target_norm.mean()
         # num = np.mean((target_norm - model_norm)**2)
-        # denom = np.mean ((target_norm - model_norm.mean())**2)
+        # denom = np.mean ((target_norm - target_mean)**2)
         # pVar = 1 - num / (denom + 1e-10)
         # return float(pVar)
 
