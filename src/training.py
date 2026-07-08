@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from numba import njit
 from src.targets_generation import Gaussian_seq
 from src.evaluation import Metrics
+from typing import Literal
 
 colors = ['#472A7A', '#375A8C', '#26828E', '#22A884', '#63CB5F', '#CAE11F']
 
@@ -133,8 +134,7 @@ def _pin_train(J, P, x, plastic, theta, dt, tau, inputs, targets, n_runs, cv_thr
     
 class PINning:
     """
-    Partial In Network training (Rajan, Harvey & Tank, 2016),
-    using the FORCE learning rule (Sussillo & Abbott, 2009).
+    Partial In Network training (Rajan, Harvey & Tank, 2016), using the FORCE learning rule (Sussillo & Abbott, 2009).
     """
     def __init__(self, p, rnn, targets, p0):
         self.rnn = rnn
@@ -256,23 +256,43 @@ class PINning:
         model.P = data['P']
         return model, data['inputs']
 
-    def display_weight_change(self):
+    def display_weight_distribution(self, value: Literal['positive', 'negative', 'all'], bins=60):
         """
-        Distribution of |J_trained - J_init|, restricted to the trainable (plastic) columns of J.
+        Log-probability-density of the individual elements of J, before (J_init) and after (J) training.
         """
-        delta = self.rnn.J[:, self.plastic_neurons] - self.rnn.J_init[:, self.plastic_neurons]
-        delta = np.abs(delta.flatten())
-        delta = delta[delta > 0]
-        plt.figure(figsize=(8, 4))
-        plt.hist(delta, bins=100, color="#472A7A", log=True)
-        plt.xlabel('|ΔJ| (synaptic strength change)')
-        plt.ylabel('Count (log scale)')
-        plt.title('Distribution of synaptic strength changes (plastic synapses)')
+        if value == 'positive':
+            J_init_full = self.rnn.J_init
+            J_full = self.rnn.J
+            J_init = J_init_full[J_init_full >= 0]
+            J = J_full[J_full >= 0]
+        elif value == 'negative':
+            J_init_full = self.rnn.J_init
+            J_full = self.rnn.J
+            J_init = J_init_full[J_init_full <= 0]
+            J = J_full[J_full <= 0]
+        else:
+            J_init = self.rnn.J_init
+            J = self.rnn.J
+        combined = np.concatenate([J_init.flatten(), J.flatten()])
+        bin_range = (combined.min(), combined.max())
+        def log_density(J):
+            counts, edges = np.histogram(J.flatten(), bins=bins, range=bin_range, density=True)
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            mask = counts > 0
+            return centers[mask], np.log10(counts[mask])
+        x_rand, y_rand = log_density(self.rnn.J_init)
+        x_pinned, y_pinned = log_density(self.rnn.J)
+        plt.figure(figsize=(6, 6))
+        plt.plot(x_rand, y_rand, 's', color='#472A7A', markersize=4, label='$J_{Rand}$')
+        plt.plot(x_pinned, y_pinned, 's', color='#26828E', markersize=4,
+                 label=f'$J_{{PINned,\\ {self.p*100:.0f}\\%}}$')
+        plt.grid(visible = True, which = 'both', axis = 'both')
+        plt.xlabel('Synaptic strength')
+        plt.ylabel('Log probability density, $10^x$')
+        plt.title(f'Distribution of {value} weights')
+        plt.legend()
         plt.tight_layout()
         plt.show()
-        ratio = delta.max() / np.median(delta)
-        print(f"max / median |ΔJ| ratio: {ratio:.1f} "
-              f"(paper reports ~20 for a sparsely PINned network)")
 
     def display_cv(self, errors):
         plt.figure(figsize=(8, 4))
@@ -304,3 +324,101 @@ class PINning:
         plt.title('Simulated normalized rate')
         plt.legend()
         plt.show()
+
+
+
+
+@njit(cache=True, fastmath=True)
+def _constrained_pin_train(J, P, x, plastic, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, p_reg):
+    """
+    _pin_train method that allow constraints to be imposed on the training
+    """
+    N = J.shape[0]
+    pN = plastic.shape[0]
+    T_steps = inputs.shape[1]
+    errors = np.empty(n_runs, dtype=np.float64)
+    j_norms = np.empty(n_runs, dtype=np.float64)
+
+    r = 1.0 / (1.0 + np.exp(-(x - theta)))
+    z = np.empty(N, dtype=np.float64)
+    rp = np.empty(pN, dtype=np.float64)
+    Pr = np.empty(pN, dtype=np.float64)
+    e = np.empty(N, dtype=np.float64)
+    n_done = n_runs
+
+    for run in range(n_runs):
+        for i in range(N):
+            x[i] = np.random.standard_normal() * x_init_scale
+            r[i] = 1.0 / (1.0 + np.exp(-(x[i] - theta)))
+
+        run_error = 0.0
+        for t in range(T_steps):
+            for i in range(N):
+                acc = 0.0
+                Ji = J[i]
+                for j in range(N):
+                    acc += Ji[j] * r[j]
+                z[i] = acc
+
+            for a in range(pN):
+                rp[a] = r[plastic[a]]
+
+            for a in range(pN):
+                acc = 0.0
+                Pa = P[a]
+                for b in range(pN):
+                    acc += Pa[b] * rp[b]
+                Pr[a] = acc
+
+            denom = 1.0
+            for a in range(pN):
+                denom += rp[a] * Pr[a]
+            c = 1.0 / denom
+
+            for a in range(pN):
+                cPa = c * Pr[a]
+                Pa = P[a]
+                for b in range(pN):
+                    Pa[b] -= cPa * Pr[b]
+
+            for a in range(pN): # ensures P's symetry
+                for b in range(a + 1, pN):
+                    avg = 0.5 * (P[a, b] + P[b, a])
+                    P[a, b] = avg
+                    P[b, a] = avg
+
+            if p_reg > 0.0:
+                for a in range(pN):
+                    P[a, a] += p_reg
+
+            step_err = 0.0
+            for i in range(N):
+                ei = z[i] - targets[i, t]
+                e[i] = ei
+                step_err += ei * ei
+            run_error += step_err / N
+
+            for i in range(N):
+                cei = c * e[i]
+                Ji = J[i]
+                for b in range(pN):
+                    Ji[plastic[b]] -= cei * Pr[b]
+
+            for i in range(N):
+                x[i] = x[i] + dt * (-x[i] + z[i] + inputs[i, t]) / tau
+                r[i] = 1.0 / (1.0 + np.exp(-(x[i] - theta)))
+
+        run_error /= T_steps
+        errors[run] = run_error
+
+        norm = 0.0
+        for i in range(N):
+            for j in range(N):
+                norm += J[i,j] * J[i,j]
+        j_norms[run] = norm ** 0.5
+
+        if run_error < cv_threshold:
+            n_done = run + 1
+            break
+
+    return errors[:n_done], j_norms[:n_done]
