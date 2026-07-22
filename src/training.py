@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from numba import njit
+from scipy.optimize import nnls
 from src.targets_generation import Gaussian_seq
 from src.evaluation import Metrics
 from typing import Literal
@@ -148,50 +149,6 @@ class PINning:
     def _get_plastic_rates(self):
         return self.rnn.r[self.plastic_neurons]
 
-    def t_step(self, pre_rate, target_t):
-        """
-        One FORCE update
-        """
-        r_plastic = pre_rate[self.plastic_neurons]
-        Pr = self.P @ r_plastic
-        c = 1.0 / (1.0 + r_plastic @ Pr) # effective learning rate
-        self.P -= c*np.outer(Pr, Pr) # RLS
-        self.P = 0.5 * (self.P + self.P.T) # to ensure symetry
-        self.e = self.rnn.z - target_t
-        self.rnn.J[:, self.plastic_neurons] -= np.outer(self.e, c*Pr)
-
-    # def train(self, inputs, n_runs, cv_threshold, DEBUG=False):
-    #     """
-    #     Minimizes the mean squared error
-    #     """
-    #     T_steps = inputs.shape[1]
-    #     errors = []
-    #     for run in range(n_runs):
-    #         self.rnn.x = np.random.randn(self.rnn.N) * 0.1
-    #         self.rnn.r = self.rnn.sigm(self.rnn.x)
-    #         run_error = 0.0
-    #         for t in range(T_steps):
-    #             pre_rate = self.rnn.r.copy()
-    #             self.rnn.step(inputs[:, t])
-    #             self.t_step(pre_rate, self.targets[:, t])
-    #             run_error += np.mean(self.e**2)
-    #         run_error /= T_steps
-    #         errors.append(run_error)
-
-    #         if DEBUG:
-    #             print(f"Run {run+1} | run_error={run_error:.6f} | "
-    #                 f"e mean={self.e.mean():.4f} | "
-    #                 f"e std={self.e.std():.4f} | "
-    #                 f"z mean={self.rnn.z.mean():.4f} | "
-    #                 f"target mean={self.targets.mean():.4f}")
-
-    #         if (run+1) % 50 == 0:
-    #             print(f"Run {run+1}/{n_runs}, run_error = {run_error:.4f}") # displays progression
-    #         if run_error < cv_threshold:
-    #             print(f"Converged at run {run+1}, run_error = {run_error:.4f}")
-    #             break
-    #     return errors
-
     def train(self, inputs, n_runs, cv_threshold, DEBUG=False, p_reg=1e-9):
         inputs = np.ascontiguousarray(inputs, dtype=np.float64)
         self.inputs = inputs # kept so save() can persist the exact frozen input used
@@ -217,89 +174,6 @@ class PINning:
             print(f"Converged at run {len(errors)}, run_error = {errors[-1]:.4f} | ||J||={j_norms[-1]:.2f}")
 
         return errors, j_norms
-
-    def train_constrained(self, inputs, n_runs, cv_threshold, DEBUG=False, p_reg=1e-9):
-        """
-        Continues training from the already-trained sub-matrix of plastic connections: 
-        - entries that are currently negative are frozen at their trained value
-        - entries that are currently positive are reinitialized from a |N(0, g/sqrt(N))| distribution, and are the only one re-trained (cliped on [0, +inf)).
-        """
-        J = self.rnn.J
-        pN = self.pN
-        N = self.rnn.N
-        mask = np.zeros((N, pN), dtype=np.bool_)
-        for b in range(pN):
-            j = self.plastic_neurons[b]
-            positive = J[:, j] >= 0
-            mask[:, b] = positive
-            n_pos = int(positive.sum())
-            J[positive, j] = np.abs(np.random.normal(0, self.rnn.g / np.sqrt(N), n_pos))
-        inputs = np.ascontiguousarray(inputs, dtype=np.float64)
-        self.inputs = inputs
-        targets = np.ascontiguousarray(self.targets, dtype=np.float64)
-        self.rnn.J = np.ascontiguousarray(J, dtype=np.float64)
-        self.P = np.ascontiguousarray(self.P, dtype=np.float64)
-        x = np.ascontiguousarray(self.rnn.x, dtype=np.float64)
-        plastic = np.ascontiguousarray(self.plastic_neurons, dtype=np.int64)
-        mask = np.ascontiguousarray(mask)
-        errors, j_norms = _constrained_pin_train(
-            self.rnn.J, self.P, x, plastic, mask,
-            float(self.rnn.theta), float(self.rnn.dt), float(self.rnn.tau),
-            inputs, targets, int(n_runs), float(cv_threshold), 0.1, float(p_reg),
-        )
-        self.rnn.x = x
-        self.rnn.r = self.rnn.sigm(self.rnn.x)
-        errors = list(errors)
-        j_norms = list(j_norms)
-        for k in range(0, len(errors)):
-            delta_norm = j_norms[k] - (j_norms[k-1] if k > 0 else j_norms[0])
-            if DEBUG:
-                print(f"Run {k+1} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f} | Δ||J||={delta_norm:+.2f}")
-            if (k+1) % 50 == 0:
-                print(f"Run {k+1}/{n_runs}, run_error = {errors[k]:.4f} | ||J||={j_norms[k]:.2f} | Δ||J||={delta_norm:+.2f}")
-        if len(errors) < n_runs:
-            print(f"Converged at run {len(errors)}, run_error = {errors[-1]:.4f} | ||J||={j_norms[-1]:.2f}")
-        return errors, j_norms
-
-    def save(self, filepath):
-        """
-        Saves the model so its weigths can be used later without re-training.
-        """
-        np.savez(
-            filepath,
-            J=self.rnn.J,
-            J_init=self.rnn.J_init,
-            inputs=self.inputs,
-            targets=self.targets,
-            theta=self.rnn.theta,
-            dt=self.rnn.dt,
-            tau=self.rnn.tau,
-            N=self.rnn.N,
-            g=self.rnn.g,
-            p0=self.rnn.p0,
-            p=self.p,
-            P=self.P,
-            plastic_neurons=self.plastic_neurons,
-            t=np.arange(self.inputs.shape[1]) * self.rnn.dt
-        )
-
-    @staticmethod
-    def load(filepath):
-        """
-        Reloads the model previously saved.
-        """
-        data = np.load(filepath)
-        rnn = RNN(
-            N=int(data['N']), g=float(data['g']), dt=float(data['dt']),
-            tau=float(data['tau']), theta=float(data['theta']), p0=float(data['p0']),
-        )
-        rnn.J = data['J']
-        rnn.J_init = data['J_init']
-        rnn.t = data['t']
-        model = PINning(p=float(data['p']), rnn=rnn, targets=data['targets'], p0=float(data['p0']))
-        model.plastic_neurons = data['plastic_neurons']
-        model.P = data['P']
-        return model, data['inputs']
 
     def display_weight_distribution(self, value: Literal['positive', 'negative', 'all'], bins=60):
         """
@@ -370,13 +244,51 @@ class PINning:
         plt.legend()
         plt.show()
 
+    def save(self, filepath):
+        """
+        Saves the model so its weigths can be used later without re-training.
+        """
+        np.savez(
+            filepath,
+            J=self.rnn.J,
+            J_init=self.rnn.J_init,
+            inputs=self.inputs,
+            targets=self.targets,
+            theta=self.rnn.theta,
+            dt=self.rnn.dt,
+            tau=self.rnn.tau,
+            N=self.rnn.N,
+            g=self.rnn.g,
+            p0=self.rnn.p0,
+            p=self.p,
+            P=self.P,
+            plastic_neurons=self.plastic_neurons,
+            t=np.arange(self.inputs.shape[1]) * self.rnn.dt
+        )
 
+    @staticmethod
+    def load(filepath):
+        """
+        Reloads the model previously saved.
+        """
+        data = np.load(filepath)
+        rnn = RNN(
+            N=int(data['N']), g=float(data['g']), dt=float(data['dt']),
+            tau=float(data['tau']), theta=float(data['theta']), p0=float(data['p0']),
+        )
+        rnn.J = data['J']
+        rnn.J_init = data['J_init']
+        rnn.t = data['t']
+        model = PINning(p=float(data['p']), rnn=rnn, targets=data['targets'], p0=float(data['p0']))
+        model.plastic_neurons = data['plastic_neurons']
+        model.P = data['P']
+        return model, data['inputs']
 
 
 @njit(cache=True, fastmath=True)
-def _constrained_pin_train(J, P, x, plastic, mask, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, p_reg):
+def _pgd_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, eta, eta_decay, lam):
     """
-    _pin_train, but the update rule to J[i, plastic[b]] is only applied where mask[i, b] is True, and clipped back to 0 whenever it would go negative.
+    Projected gradient descent, projected at every timestep t onto the Dale's-law sign constraint.
     """
     N = J.shape[0]
     pN = plastic.shape[0]
@@ -387,11 +299,11 @@ def _constrained_pin_train(J, P, x, plastic, mask, theta, dt, tau, inputs, targe
     r = 1.0 / (1.0 + np.exp(-(x - theta)))
     z = np.empty(N, dtype=np.float64)
     rp = np.empty(pN, dtype=np.float64)
-    Pr = np.empty(pN, dtype=np.float64)
-    e = np.empty(N, dtype=np.float64)
     n_done = n_runs
 
     for run in range(n_runs):
+        eta_run = eta / (1.0 + eta_decay * run)
+
         for i in range(N):
             x[i] = np.random.standard_normal() * x_init_scale
             r[i] = 1.0 / (1.0 + np.exp(-(x[i] - theta)))
@@ -408,51 +320,23 @@ def _constrained_pin_train(J, P, x, plastic, mask, theta, dt, tau, inputs, targe
             for a in range(pN):
                 rp[a] = r[plastic[a]]
 
-            for a in range(pN):
-                acc = 0.0
-                Pa = P[a]
-                for b in range(pN):
-                    acc += Pa[b] * rp[b]
-                Pr[a] = acc
-
-            denom = 1.0
-            for a in range(pN):
-                denom += rp[a] * Pr[a]
-            c = 1.0 / denom
-
-            for a in range(pN):
-                cPa = c * Pr[a]
-                Pa = P[a]
-                for b in range(pN):
-                    Pa[b] -= cPa * Pr[b]
-
-            for a in range(pN): # ensures P's symetry
-                for b in range(a + 1, pN):
-                    avg = 0.5 * (P[a, b] + P[b, a])
-                    P[a, b] = avg
-                    P[b, a] = avg
-
-            if p_reg > 0.0:
-                for a in range(pN):
-                    P[a, a] += p_reg
-
             step_err = 0.0
             for i in range(N):
                 ei = z[i] - targets[i, t]
-                e[i] = ei
                 step_err += ei * ei
-            run_error += step_err / N
-
-            for i in range(N):
-                cei = c * e[i]
                 Ji = J[i]
-                maski = mask[i]
                 for b in range(pN):
-                    if maski[b]:
-                        new_val = Ji[plastic[b]] - cei * Pr[b]
+                    jb = plastic[b]
+                    grad = ei * rp[b] + lam * Ji[jb]
+                    new_val = Ji[jb] - eta_run * grad
+                    if sign[b] > 0:
                         if new_val < 0.0:
                             new_val = 0.0
-                        Ji[plastic[b]] = new_val
+                    else:
+                        if new_val > 0.0:
+                            new_val = 0.0
+                    Ji[jb] = new_val
+            run_error += step_err / N
 
             for i in range(N):
                 x[i] = x[i] + dt * (-x[i] + z[i] + inputs[i, t]) / tau
@@ -464,7 +348,7 @@ def _constrained_pin_train(J, P, x, plastic, mask, theta, dt, tau, inputs, targe
         norm = 0.0
         for i in range(N):
             for j in range(N):
-                norm += J[i,j] * J[i,j]
+                norm += J[i, j] * J[i, j]
         j_norms[run] = norm ** 0.5
 
         if run_error < cv_threshold:
@@ -472,3 +356,60 @@ def _constrained_pin_train(J, P, x, plastic, mask, theta, dt, tau, inputs, targe
             break
 
     return errors[:n_done], j_norms[:n_done]
+
+
+class Dale_PINning(PINning):
+    """
+    PINning on a network checking Dale's principle.
+    """
+    def set_dale_constraint(self, p_exc):
+        """
+        Sets a fraction p_exc of excitatory neurons (all of their outgoing synapses are positive),
+        the rest are set as inhibitory neurons (all of their outgoing synapses are negative).
+        """
+        pN = self.pN
+        n_exc = int(round(p_exc * pN))
+        sign = -np.ones(pN, dtype=np.int64)
+        exc_slots = np.random.choice(pN, n_exc, replace=False)
+        sign[exc_slots] = 1
+        self.sign = sign
+        for b in range(pN):
+            j = self.plastic_neurons[b]
+            if sign[b] > 0:
+                self.rnn.J[:, j] = np.abs(self.rnn.J[:, j])
+            else:
+                self.rnn.J[:, j] = -np.abs(self.rnn.J[:, j])
+        self.rnn.J_init = self.rnn.J.copy()
+
+    def train_dale_pgd(self, inputs, n_runs, eta, cv_threshold, lam=0.0, eta_decay=0.0, DEBUG=False, x_init_scale=0.1):
+        """
+        On-line training via projected gradient descent onto the Dale's-law sign constraint.
+        """
+        if not hasattr(self, 'sign'):
+            raise RuntimeError("call set_dale_constraint(p_exc) before train_dale_pgd()")
+        inputs = np.ascontiguousarray(inputs, dtype=np.float64)
+        self.inputs = inputs
+        targets = np.ascontiguousarray(self.targets, dtype=np.float64)
+        self.rnn.J = np.ascontiguousarray(self.rnn.J, dtype=np.float64)
+        x = np.ascontiguousarray(self.rnn.x, dtype=np.float64)
+        plastic = np.ascontiguousarray(self.plastic_neurons, dtype=np.int64)
+        sign = np.ascontiguousarray(self.sign, dtype=np.int64)
+
+        errors, j_norms = _pgd_train(
+            self.rnn.J, x, plastic, sign, float(self.rnn.theta), float(self.rnn.dt), float(self.rnn.tau),
+            inputs, targets, int(n_runs), float(cv_threshold), float(x_init_scale), float(eta), float(eta_decay), float(lam)
+        )
+        self.rnn.x = x
+        self.rnn.r = self.rnn.sigm(self.rnn.x)
+        errors = list(errors)
+        j_norms = list(j_norms)
+
+        for k in range(len(errors)):
+            if DEBUG:
+                print(f"Run {k+1}/{n_runs} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f}")
+            elif (k + 1) % 10 == 0:
+                print(f"Run {k+1}/{n_runs} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f}")
+        if len(errors) < n_runs:
+            print(f"Converged at run {len(errors)}, run_error={errors[-1]:.6f} | ||J||={j_norms[-1]:.2f}")
+
+        return errors, j_norms
