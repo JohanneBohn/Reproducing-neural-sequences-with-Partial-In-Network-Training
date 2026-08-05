@@ -244,12 +244,16 @@ class PINning:
         plt.legend()
         plt.show()
 
+    _last_run_attrs = (
+        'last_method', 'last_eta', 'last_eta_decay', 'last_lam', 'last_n_runs',
+        'last_cv_threshold', 'last_stagnation_window', 'last_stagnation_tol'
+    )
+
     def save(self, filepath):
         """
-        Saves the model so its weigths can be used later without re-training.
+        Saves the model so its weigths can be used later without re-training; and saves its parameters.
         """
-        np.savez(
-            filepath,
+        kwargs = dict(
             J=self.rnn.J,
             J_init=self.rnn.J_init,
             inputs=self.inputs,
@@ -265,6 +269,10 @@ class PINning:
             plastic_neurons=self.plastic_neurons,
             t=np.arange(self.inputs.shape[1]) * self.rnn.dt
         )
+        for attr in self._last_run_attrs:
+            if hasattr(self, attr):
+                kwargs[attr] = getattr(self, attr)
+        np.savez(filepath, **kwargs)
 
     @staticmethod
     def load(filepath):
@@ -282,6 +290,10 @@ class PINning:
         model = PINning(p=float(data['p']), rnn=rnn, targets=data['targets'], p0=float(data['p0']))
         model.plastic_neurons = data['plastic_neurons']
         model.P = data['P']
+        for attr in PINning._last_run_attrs:
+            if attr in data.files:
+                value = data[attr]
+                setattr(model, attr, value.item() if value.ndim == 0 else value)
         return model, data['inputs']
 
 
@@ -358,14 +370,57 @@ def _pgd_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv_
     return errors[:n_done], j_norms[:n_done]
 
 
+def _fnnls_core(ZTZ, ZTx, tolerance=None):
+    """
+    Core active-set loop of Bro & de Jong's (1997) Fast NNLS,
+    adapted from the fnnls.fnnls package to take an already-computed Gram matrix ZTZ = ZᵀZ
+    and moment vector ZTx = Zᵀx directly, instead of recomputing them on every call.
+    """
+    n = ZTZ.shape[0]
+    if tolerance is None:
+        tolerance = 2.2204e-16 * n
+
+    P = np.zeros(n, dtype=bool)
+    d = np.zeros(n)
+    w = ZTx - ZTZ @ d
+    s = np.zeros(n)
+    no_update = 0
+    max_repetitions = 5
+
+    while (not np.all(P)) and np.max(w[~P]) > tolerance:
+        current_P = P.copy()
+        P[np.argmax(w * ~P)] = True
+        s[P] = np.linalg.solve(ZTZ[np.ix_(P, P)], ZTx[P])
+
+        while np.any(P) and np.min(s[P]) <= tolerance:
+            q = P & (s <= tolerance)
+            alpha = np.min(d[q] / (d[q] - s[q]))
+            d = d + alpha * (s - d)
+            P[d <= tolerance] = False
+            s[P] = np.linalg.solve(ZTZ[np.ix_(P, P)], ZTx[P])
+            s[~P] = 0.0
+
+        d = s.copy()
+        w = ZTx - ZTZ @ d
+
+        if np.all(current_P == P):
+            no_update += 1
+        else:
+            no_update = 0
+        if no_update >= max_repetitions:
+            break
+
+    return d
+
+
 class Dale_PINning(PINning):
     """
     PINning on a network checking Dale's principle.
     """
     def set_dale_constraint(self, p_exc):
         """
-        Sets a fraction p_exc of excitatory neurons (all of their outgoing synapses are positive),
-        the rest are set as inhibitory neurons (all of their outgoing synapses are negative).
+        Sets a fraction p_exc of excitatory plastic neurons (all of their outgoing synapses are positive),
+        the rest are set as inhibitory plastic neurons (all of their outgoing synapses are negative).
         """
         pN = self.pN
         n_exc = int(round(p_exc * pN))
@@ -376,6 +431,24 @@ class Dale_PINning(PINning):
         for b in range(pN):
             j = self.plastic_neurons[b]
             if sign[b] > 0:
+                self.rnn.J[:, j] = np.abs(self.rnn.J[:, j])
+            else:
+                self.rnn.J[:, j] = -np.abs(self.rnn.J[:, j])
+        self.rnn.J_init = self.rnn.J.copy()
+
+    def set_dale_constraint_full(self, p_exc):
+        """
+        Like set_dale_constraint, but applies Dale's principle to all N neurons (not just the pN plastic ones).
+        """
+        N = self.rnn.N
+        n_exc = int(round(p_exc * N))
+        global_sign = -np.ones(N, dtype=np.int64)
+        exc_neurons = np.random.choice(N, n_exc, replace=False)
+        global_sign[exc_neurons] = 1
+        self.global_sign = global_sign
+        self.sign = global_sign[self.plastic_neurons]
+        for j in range(N):
+            if global_sign[j] > 0:
                 self.rnn.J[:, j] = np.abs(self.rnn.J[:, j])
             else:
                 self.rnn.J[:, j] = -np.abs(self.rnn.J[:, j])
@@ -412,4 +485,68 @@ class Dale_PINning(PINning):
         if len(errors) < n_runs:
             print(f"Converged at run {len(errors)}, run_error={errors[-1]:.6f} | ||J||={j_norms[-1]:.2f}")
 
+        self.last_method = 'pgd'
+        self.last_eta = eta
+        self.last_eta_decay = eta_decay
+        self.last_lam = lam
+        self.last_cv_threshold = cv_threshold
+        self.last_n_runs = len(errors)
+
         return errors, j_norms
+
+    def train_dale_fnnls(self, inputs, n_runs, lam, DEBUG=False, stagnation_window=5, stagnation_tol=1e-4):
+        """
+        Batch Dale-constrained training via Fast NNLS (Bro & de Jong, 1997).
+        """
+        if not hasattr(self, 'sign'):
+            raise RuntimeError("call set_dale_constraint(p_exc) before train_fnnls_dale()")
+        N = self.rnn.N
+        pN = self.pN
+        plastic = self.plastic_neurons
+        sign = self.sign.astype(np.float64)
+        T_steps = inputs.shape[1]
+        inputs = np.ascontiguousarray(inputs, dtype=np.float64)
+        self.inputs = inputs
+        errors = []
+
+        for run in range(n_runs):
+            self.rnn.x = np.random.randn(N) * 0.1
+            self.rnn.r = self.rnn.sigm(self.rnn.x)
+            z_traj = np.empty((N, T_steps))
+            rp_traj = np.empty((pN, T_steps))
+            for t in range(T_steps):
+                r_pre = self.rnn.r[plastic]
+                self.rnn.step(inputs[:, t])
+                z_traj[:, t] = self.rnn.z
+                rp_traj[:, t] = r_pre
+
+            run_error = float(np.mean((z_traj - self.targets) ** 2))
+            errors.append(run_error)
+
+            A_signed = (rp_traj * sign[:, None]).T  # (T_steps, pN)
+            H = A_signed.T @ A_signed
+            H[np.diag_indices(pN)] += lam
+            F = A_signed.T @ self.targets.T  # (pN, N), column i is A_signedᵀ targets[i, :]
+
+            for i in range(N):
+                w_hat = _fnnls_core(H, F[:, i])
+                self.rnn.J[i, plastic] = sign * w_hat
+
+            if DEBUG:
+                print(f"Run {run+1}/{n_runs} | run_error={run_error:.6f} | ||J||={np.linalg.norm(self.rnn.J):.2f}")
+
+            if stagnation_tol and len(errors) >= stagnation_window:
+                recent = errors[-stagnation_window:]
+                spread = (max(recent) - min(recent)) / (abs(np.mean(recent)) + 1e-12)
+                if spread < stagnation_tol:
+                    print(f"Stagnated at run {run+1}/{n_runs}, run_error={run_error:.6f} "
+                          f"(spread over last {stagnation_window} runs: {spread:.2e} < {stagnation_tol})")
+                    break
+
+        self.last_method = 'fnnls'
+        self.last_lam = lam
+        self.last_n_runs = len(errors)
+        self.last_stagnation_window = stagnation_window
+        self.last_stagnation_tol = stagnation_tol
+
+        return errors
