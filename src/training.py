@@ -246,12 +246,12 @@ class PINning:
 
     _last_run_attrs = (
         'last_method', 'last_eta', 'last_eta_decay', 'last_lam', 'last_n_runs',
-        'last_cv_threshold', 'last_stagnation_window', 'last_stagnation_tol'
+        'last_cv_threshold', 'last_stagnation_window', 'last_stagnation_tol', 'last_eta_inh_mult', 'last_K'
     )
 
     def save(self, filepath):
         """
-        Saves the model so its weigths can be used later without re-training; and saves its parameters.
+        Saves the model so its weigths can be used later without re-training, and logs its parameters.
         """
         kwargs = dict(
             J=self.rnn.J,
@@ -370,11 +370,206 @@ def _pgd_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv_
     return errors[:n_done], j_norms[:n_done]
 
 
+@njit(cache=True, fastmath=True)
+def _bptt_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, eta, eta_decay, lam, K):
+    """
+    Truncated backpropagation-through-time (BPTT), projected at every weight update onto the Dale's-law sign constraint.
+
+    K = rolling window of K timesteps through which the gradients are back-propagated.
+    K = 1 => reproduction of _pgd_train's gradient.
+    """
+    N = J.shape[0]
+    pN = plastic.shape[0]
+    T_steps = inputs.shape[1]
+    errors = np.empty(n_runs, dtype=np.float64)
+    j_norms = np.empty(n_runs, dtype=np.float64)
+
+    r = 1.0 / (1.0 + np.exp(-(x - theta)))
+    n_done = n_runs
+
+    r_hist = np.empty((K, N), dtype=np.float64)
+    e_hist = np.empty((K, N), dtype=np.float64)
+    delta = np.empty(N, dtype=np.float64)
+    eff = np.empty(N, dtype=np.float64)
+    Jt_eff = np.empty(N, dtype=np.float64)
+    z = np.empty(N, dtype=np.float64)
+    grad = np.empty((N, pN), dtype=np.float64)
+
+    for run in range(n_runs):
+        eta_run = eta / (1.0 + eta_decay * run)
+
+        for i in range(N):
+            x[i] = np.random.standard_normal() * x_init_scale
+            r[i] = 1.0 / (1.0 + np.exp(-(x[i] - theta)))
+
+        run_error = 0.0
+        chunk_start = 0
+        while chunk_start < T_steps:
+            chunk_end = chunk_start + K
+            if chunk_end > T_steps:
+                chunk_end = T_steps
+            K_actual = chunk_end - chunk_start
+
+            # forward pass through the chunk:
+            for k in range(K_actual):
+                t = chunk_start + k
+                for i in range(N):
+                    r_hist[k, i] = r[i]
+                for i in range(N):
+                    acc = 0.0
+                    Ji = J[i]
+                    for j in range(N):
+                        acc += Ji[j] * r[j]
+                    z[i] = acc
+                step_err = 0.0
+                for i in range(N):
+                    ei = z[i] - targets[i, t]
+                    e_hist[k, i] = ei
+                    step_err += ei * ei
+                run_error += step_err / N
+                for i in range(N):
+                    x[i] = x[i] + dt * (-x[i] + z[i] + inputs[i, t]) / tau
+                    r[i] = 1.0 / (1.0 + np.exp(-(x[i] - theta)))
+
+            # truncated backward pass within the chunk:
+            for i in range(N):
+                delta[i] = 0.0
+            for b in range(pN):
+                for i in range(N):
+                    grad[i, b] = 0.0
+
+            for k in range(K_actual - 1, -1, -1):
+                for i in range(N):
+                    eff[i] = e_hist[k, i] + (dt / tau) * delta[i]
+
+                for b in range(pN):
+                    rpb = r_hist[k, plastic[b]]
+                    for i in range(N):
+                        grad[i, b] += eff[i] * rpb
+
+                for j in range(N):
+                    acc = 0.0
+                    for i in range(N):
+                        acc += J[i, j] * eff[i]
+                    Jt_eff[j] = acc
+
+                for j in range(N):
+                    rj = r_hist[k, j]
+                    Dj = rj * (1.0 - rj)
+                    delta[j] = (1.0 - dt / tau) * delta[j] + Dj * Jt_eff[j]
+
+            # apply the projected accumulated gradient:
+            for i in range(N):
+                for b in range(pN):
+                    jb = plastic[b]
+                    g = grad[i, b] + lam * J[i, jb]
+                    new_val = J[i, jb] - eta_run * g
+                    if sign[b] > 0:
+                        if new_val < 0.0:
+                            new_val = 0.0
+                    else:
+                        if new_val > 0.0:
+                            new_val = 0.0
+                    J[i, jb] = new_val
+
+            chunk_start = chunk_end
+
+        run_error /= T_steps
+        errors[run] = run_error
+
+        norm = 0.0
+        for i in range(N):
+            for j in range(N):
+                norm += J[i, j] * J[i, j]
+        j_norms[run] = norm ** 0.5
+
+        if run_error < cv_threshold:
+            n_done = run + 1
+            break
+
+    return errors[:n_done], j_norms[:n_done]
+
+
+@njit(cache=True, fastmath=True)
+def _pgd_train_scaled(J, x, plastic, sign, eta_scale, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, eta, eta_decay, lam):
+    """
+    Same as _pgd_train, but each plastic neuron has its own learning-rate multiplier
+    -> during the training, inhibitory & excitatory plastic weights change at different magnitudes.
+    """
+    N = J.shape[0]
+    pN = plastic.shape[0]
+    T_steps = inputs.shape[1]
+    errors = np.empty(n_runs, dtype=np.float64)
+    j_norms = np.empty(n_runs, dtype=np.float64)
+
+    r = 1.0 / (1.0 + np.exp(-(x - theta)))
+    z = np.empty(N, dtype=np.float64)
+    rp = np.empty(pN, dtype=np.float64)
+    n_done = n_runs
+
+    for run in range(n_runs):
+        eta_run = eta / (1.0 + eta_decay * run)
+
+        for i in range(N):
+            x[i] = np.random.standard_normal() * x_init_scale
+            r[i] = 1.0 / (1.0 + np.exp(-(x[i] - theta)))
+
+        run_error = 0.0
+        for t in range(T_steps):
+            for i in range(N):
+                acc = 0.0
+                Ji = J[i]
+                for j in range(N):
+                    acc += Ji[j] * r[j]
+                z[i] = acc
+
+            for a in range(pN):
+                rp[a] = r[plastic[a]]
+
+            step_err = 0.0
+            for i in range(N):
+                ei = z[i] - targets[i, t]
+                step_err += ei * ei
+                Ji = J[i]
+                for b in range(pN):
+                    jb = plastic[b]
+                    grad = ei * rp[b] + lam * Ji[jb]
+                    new_val = Ji[jb] - eta_run * eta_scale[b] * grad
+                    if sign[b] > 0:
+                        if new_val < 0.0:
+                            new_val = 0.0
+                    else:
+                        if new_val > 0.0:
+                            new_val = 0.0
+                    Ji[jb] = new_val
+            run_error += step_err / N
+
+            for i in range(N):
+                x[i] = x[i] + dt * (-x[i] + z[i] + inputs[i, t]) / tau
+                r[i] = 1.0 / (1.0 + np.exp(-(x[i] - theta)))
+
+        run_error /= T_steps
+        errors[run] = run_error
+
+        norm = 0.0
+        for i in range(N):
+            for j in range(N):
+                norm += J[i, j] * J[i, j]
+        j_norms[run] = norm ** 0.5
+
+        if run_error < cv_threshold:
+            n_done = run + 1
+            break
+
+    return errors[:n_done], j_norms[:n_done]
+
+
 def _fnnls_core(ZTZ, ZTx, tolerance=None):
     """
-    Core active-set loop of Bro & de Jong's (1997) Fast NNLS,
-    adapted from the fnnls.fnnls package to take an already-computed Gram matrix ZTZ = ZᵀZ
-    and moment vector ZTx = Zᵀx directly, instead of recomputing them on every call.
+    Core active-set loop of Bro & de Jong's (1997) Fast NNLS, adapted from the fnnls.fnnls package to directly take already-computed:
+    - Gram matrix ZTZ = ZᵀZ
+    - moment vector ZTx = Zᵀx
+    instead of recomputing them on every call.
     """
     n = ZTZ.shape[0]
     if tolerance is None:
@@ -454,6 +649,61 @@ class Dale_PINning(PINning):
                 self.rnn.J[:, j] = -np.abs(self.rnn.J[:, j])
         self.rnn.J_init = self.rnn.J.copy()
 
+    def set_dale_constraint_mixed(self, p_exc):
+        """
+        Applies Dale's principle to all N neurons,
+        while ensuring that the E/I proportion p_exc is implemented in the plastic sub-sample.
+        """
+        N = self.rnn.N
+        pN = self.pN
+        plastic_mask = np.zeros(N, dtype=np.bool_)
+        plastic_mask[self.plastic_neurons] = True
+        rest_neurons = np.nonzero(~plastic_mask)[0]
+
+        global_sign = np.empty(N, dtype=np.int64)
+
+        n_exc_plastic = int(round(p_exc * pN))
+        sign_plastic = -np.ones(pN, dtype=np.int64)
+        exc_plastic = np.random.choice(pN, n_exc_plastic, replace=False)
+        sign_plastic[exc_plastic] = 1
+        global_sign[self.plastic_neurons] = sign_plastic
+        self.sign = sign_plastic
+
+        n_rest = rest_neurons.shape[0]
+        n_exc_rest = int(round(p_exc * n_rest))
+        sign_rest = -np.ones(n_rest, dtype=np.int64)
+        exc_rest = np.random.choice(n_rest, n_exc_rest, replace=False)
+        sign_rest[exc_rest] = 1
+        global_sign[rest_neurons] = sign_rest
+
+        self.global_sign = global_sign
+        for j in range(N):
+            if global_sign[j] > 0:
+                self.rnn.J[:, j] = np.abs(self.rnn.J[:, j])
+            else:
+                self.rnn.J[:, j] = -np.abs(self.rnn.J[:, j])
+        self.rnn.J_init = self.rnn.J.copy()
+
+    def set_dale_constraint_balanced(self, p_exc, inh_scale=1.0):
+        """
+        Like set_dale_constraint, but scales the magnitude of the inhibitory plastic weights by inh_scale relative to the excitatory ones.
+        Motivated by E/I balanced-network theory (Van Vreeswijk & Sompolinsky): inhibitory neurons are a numerical minority but individually stronger,
+        so that total inhibitory drive can match total excitatory drive.
+        """
+        pN = self.pN
+        n_exc = int(round(p_exc * pN))
+        sign = -np.ones(pN, dtype=np.int64)
+        exc_slots = np.random.choice(pN, n_exc, replace=False)
+        sign[exc_slots] = 1
+        self.sign = sign
+        for b in range(pN):
+            j = self.plastic_neurons[b]
+            if sign[b] > 0:
+                self.rnn.J[:, j] = np.abs(self.rnn.J[:, j])
+            else:
+                self.rnn.J[:, j] = -np.abs(self.rnn.J[:, j]) * inh_scale
+        self.rnn.J_init = self.rnn.J.copy()
+
     def train_dale_pgd(self, inputs, n_runs, eta, cv_threshold, lam=0.0, eta_decay=0.0, DEBUG=False, x_init_scale=0.1):
         """
         On-line training via projected gradient descent onto the Dale's-law sign constraint.
@@ -491,6 +741,95 @@ class Dale_PINning(PINning):
         self.last_lam = lam
         self.last_cv_threshold = cv_threshold
         self.last_n_runs = len(errors)
+
+        return errors, j_norms
+
+    def train_dale_bptt(self, inputs, n_runs, eta, cv_threshold, K=200, lam=0.0, eta_decay=0.0, DEBUG=False, x_init_scale=0.1):
+        """
+        Truncated backpropagation-through-time (BPTT), projected at every weight update onto the Dale's-law sign constraint.
+
+        K = the truncation window length in timesteps.
+        K = 1 => reproduction of train_dale_pgd.
+        """
+        if not hasattr(self, 'sign'):
+            raise RuntimeError("call set_dale_constraint(p_exc) before train_dale_bptt()")
+        inputs = np.ascontiguousarray(inputs, dtype=np.float64)
+        self.inputs = inputs
+        targets = np.ascontiguousarray(self.targets, dtype=np.float64)
+        self.rnn.J = np.ascontiguousarray(self.rnn.J, dtype=np.float64)
+        x = np.ascontiguousarray(self.rnn.x, dtype=np.float64)
+        plastic = np.ascontiguousarray(self.plastic_neurons, dtype=np.int64)
+        sign = np.ascontiguousarray(self.sign, dtype=np.int64)
+
+        errors, j_norms = _bptt_train(
+            self.rnn.J, x, plastic, sign, float(self.rnn.theta), float(self.rnn.dt), float(self.rnn.tau),
+            inputs, targets, int(n_runs), float(cv_threshold), float(x_init_scale), float(eta), float(eta_decay), float(lam), int(K)
+        )
+        self.rnn.x = x
+        self.rnn.r = self.rnn.sigm(self.rnn.x)
+        errors = list(errors)
+        j_norms = list(j_norms)
+
+        for k in range(len(errors)):
+            if DEBUG:
+                print(f"Run {k+1}/{n_runs} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f}")
+            elif (k + 1) % 10 == 0:
+                print(f"Run {k+1}/{n_runs} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f}")
+        if len(errors) < n_runs:
+            print(f"Converged at run {len(errors)}, run_error={errors[-1]:.6f} | ||J||={j_norms[-1]:.2f}")
+
+        self.last_method = 'bptt'
+        self.last_eta = eta
+        self.last_eta_decay = eta_decay
+        self.last_lam = lam
+        self.last_cv_threshold = cv_threshold
+        self.last_n_runs = len(errors)
+        self.last_K = K
+
+        return errors, j_norms
+
+    def train_dale_pgd_scaled(self, inputs, n_runs, eta, cv_threshold, lam=0.0, eta_decay=0.0, eta_inh_mult=1.0, DEBUG=False, x_init_scale=0.1):
+        """
+        Like train_dale_pgd, but applies a separate learning-rate multiplier eta_inh_mult to the inhibitory plastic synapses.
+        => Lets training itself grow the inhibitory weights faster/slower relative to the excitatory ones.
+        
+        eta_inh_mult = 1.0 => reproduces train_dale_pgd exactly.
+        """
+        if not hasattr(self, 'sign'):
+            raise RuntimeError("call set_dale_constraint(p_exc) before train_dale_pgd_scaled()")
+        inputs = np.ascontiguousarray(inputs, dtype=np.float64)
+        self.inputs = inputs
+        targets = np.ascontiguousarray(self.targets, dtype=np.float64)
+        self.rnn.J = np.ascontiguousarray(self.rnn.J, dtype=np.float64)
+        x = np.ascontiguousarray(self.rnn.x, dtype=np.float64)
+        plastic = np.ascontiguousarray(self.plastic_neurons, dtype=np.int64)
+        sign = np.ascontiguousarray(self.sign, dtype=np.int64)
+        eta_scale = np.where(sign < 0, float(eta_inh_mult), 1.0).astype(np.float64)
+
+        errors, j_norms = _pgd_train_scaled(
+            self.rnn.J, x, plastic, sign, eta_scale, float(self.rnn.theta), float(self.rnn.dt), float(self.rnn.tau),
+            inputs, targets, int(n_runs), float(cv_threshold), float(x_init_scale), float(eta), float(eta_decay), float(lam)
+        )
+        self.rnn.x = x
+        self.rnn.r = self.rnn.sigm(self.rnn.x)
+        errors = list(errors)
+        j_norms = list(j_norms)
+
+        for k in range(len(errors)):
+            if DEBUG:
+                print(f"Run {k+1}/{n_runs} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f}")
+            elif (k + 1) % 10 == 0:
+                print(f"Run {k+1}/{n_runs} | run_error={errors[k]:.6f} | ||J||={j_norms[k]:.2f}")
+        if len(errors) < n_runs:
+            print(f"Converged at run {len(errors)}, run_error={errors[-1]:.6f} | ||J||={j_norms[-1]:.2f}")
+
+        self.last_method = 'pgd_scaled'
+        self.last_eta = eta
+        self.last_eta_decay = eta_decay
+        self.last_lam = lam
+        self.last_cv_threshold = cv_threshold
+        self.last_n_runs = len(errors)
+        self.last_eta_inh_mult = eta_inh_mult
 
         return errors, j_norms
 
