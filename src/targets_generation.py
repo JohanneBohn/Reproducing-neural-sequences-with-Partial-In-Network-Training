@@ -1,13 +1,16 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 
 colors = ['#472A7A', '#375A8C', '#26828E', '#22A884', '#63CB5F', '#CAE11F']
 
 class Gaussian_seq:
     """
-    Generates gaussian sequences.
+    Generates gaussian sequences where each neuron's activation is maximal at a specific time-stamp (t_center).
     """
     def __init__(self, T, dt):
+        self.T = T
+        self.dt = dt
         self.t = np.arange(0, T, dt)
 
     def gaussian(self, sigma, t_center):
@@ -34,7 +37,6 @@ class Gaussian_seq:
         plt.tight_layout()
         plt.show()
 
-
     def target_graph(self, T, sigma, N, neuron_list, epsilon):
         targets_rate = self.target_functions(T, sigma, N, epsilon)
         t = self.t
@@ -48,4 +50,75 @@ class Gaussian_seq:
         plt.tight_layout()
         plt.show()
 
-# class Realistic_seq: for more realistic generated data
+
+class Random_firing_gaussian_seq(Gaussian_seq):
+    """
+    Generates sequences where each neuron's maximal activation is drawn randomly on the time sequence.
+    """
+    def __init__(self, T, dt):
+        super().__init__(T, dt)
+        self.activations = None
+        self.targets_rate = None
+
+    def target_functions(self, T, sigma, N, epsilon):
+        self.activations = [random.uniform(0, T) for _ in range(N)]
+        targets_rate = np.array([self.gaussian(sigma, t_center = tc) for tc in self.activations])
+        self.targets_rate = targets_rate
+        targets_clip  = np.clip(targets_rate, epsilon, 1-epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        return targets_logit
+
+    def gaussian_graph(self, T, sigma, N, neuron_list):
+        t = self.t
+        plt.figure(figsize=(12, 4))
+        for i, color in zip(neuron_list, colors):
+            plt.plot(t, self.targets_rate[i], label=f'Neuron {i}', color=color)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Activation')
+        plt.title('Random firing gaussian targets')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def target_graph(self, T, sigma, N, neuron_list, epsilon):
+        targets_clip = np.clip(self.targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        t = self.t
+        plt.figure(figsize=(12, 4))
+        for i, color in zip(neuron_list, colors):
+            plt.plot(t, targets_logit[i], label=f'Neuron {i}', color=color)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Activation')
+        plt.title('Random firing gaussian logit targets')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
+class Multiple_gaussian_seq(Random_firing_gaussian_seq):
+    """
+    Generates sequences where each neuron has a random number of activation bumps (between 0 and max_bump).
+    """
+    def __init__(self, T, dt):
+        super().__init__(T, dt)
+        self.activations = None
+        self.targets_rate = None
+
+    def _get_bump_list(self, N, max_bump):
+        bump_list = []
+        bump_list.append(random.randint(1, max_bump) for t in range(N))
+        return bump_list
+
+    def target_functions(self, T, sigma, N, epsilon, max_bump):
+        """use self.activations -> générer des gaussiennes avec ces centres d'activation -> faire le max des points -> c'est notre cible"""
+        
+
+
+class Realistic_seq(Gaussian_seq):
+    """
+    Generates sequences with properties similar to the unavailable training data of Rajan, Harvey & Tank (2016):
+    - each neuron fires transiently once during the trial, at its tCOM (time of center of mass);
+    - bVar = 40% (~);
+    - non-negative firing rates.
+    Strategy: inject per-neuron variability (width jitter, amplitude jitter, an extra "off-sequence" bump, small rectified noise) to the idealized Gaussian sequences. 
+    """
