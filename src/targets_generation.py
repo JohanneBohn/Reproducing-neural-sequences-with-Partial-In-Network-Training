@@ -97,21 +97,99 @@ class Random_firing_gaussian_seq(Gaussian_seq):
 
 class Multiple_gaussian_seq(Random_firing_gaussian_seq):
     """
-    Generates sequences where each neuron has a random number of activation bumps (between 0 and max_bump).
+    Generates sequences where each neuron has a random number of activation bumps (between 1 and max_bump).
+    """
+    def __init__(self, T, dt):
+        super().__init__(T, dt)
+
+    def _get_bump_list(self, N, max_bump):
+        return [random.randint(1, max_bump) for _ in range(N)]
+
+    def target_functions(self, T, sigma, N, epsilon, max_bump):
+        n_bumps = self._get_bump_list(N, max_bump)
+        self.activations = [[random.uniform(0, T) for _ in range(k)] for k in n_bumps]
+        targets_rate = np.array([
+            np.max([self.gaussian(sigma, t_center=tc) for tc in centers], axis=0)
+            for centers in self.activations
+        ])
+        self.targets_rate = targets_rate
+        targets_clip = np.clip(targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        return targets_logit
+
+
+class Active_unactive_seq(Multiple_gaussian_seq):
+    """
+    Identical to Multiple_gaussian_seq, but allows for unactive neurons.
+    Those neurons' target is a constant activity level.
+    """
+    def __init__(self, T, dt):
+        super().__init__(T, dt)
+
+    def _get_bump_list(self, N, max_bump):
+            return [random.randint(0, max_bump) for _ in range(N)]
+
+    def target_functions(self, T, sigma, N, epsilon, max_bump, silent_level=(0.0, 1.0)):
+        """
+        silent_level: (low, high) range from which each unactive neuron's constant activity level is drawn uniformly.
+        """
+        n_bumps = self._get_bump_list(N, max_bump)
+        self.activations = [[random.uniform(0, T) for _ in range(k)] for k in n_bumps]
+        targets_rate = np.array([
+            np.max([self.gaussian(sigma, t_center=tc) for tc in centers], axis=0)
+            if centers else np.full_like(self.t, random.uniform(*silent_level))
+            for centers in self.activations
+        ])
+        self.targets_rate = targets_rate
+        targets_clip = np.clip(targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        return targets_logit
+
+
+class Indicator_seq(Gaussian_seq):
+    """
+    Generates targets shaped as indicator functions.
     """
     def __init__(self, T, dt):
         super().__init__(T, dt)
         self.activations = None
         self.targets_rate = None
 
-    def _get_bump_list(self, N, max_bump):
-        bump_list = []
-        bump_list.append(random.randint(1, max_bump) for t in range(N))
-        return bump_list
+    def _get_space_list(self, N):
+        return [random.uniform(0, self.T) for _ in range(N)]
 
-    def target_functions(self, T, sigma, N, epsilon, max_bump):
-        """use self.activations -> générer des gaussiennes avec ces centres d'activation -> faire le max des points -> c'est notre cible"""
-        
+    def _get_width_list(self, N, width_range):
+        return [random.uniform(*width_range) for _ in range(N)]
+
+    def characteristic(self, t_center, width):
+        return ((self.t >= t_center - width / 2) & (self.t <= t_center + width / 2)).astype(float)
+
+    def target_functions(self, T, sigma, N, epsilon, width_range=None):
+        if width_range is None:
+            width_range = (0.3 * sigma, 3 * sigma)
+        self.activations = self._get_space_list(N)
+        self.widths = self._get_width_list(N, width_range)
+        targets_rate = np.array([
+            self.characteristic(tc, w) for tc, w in zip(self.activations, self.widths)
+        ])
+        self.targets_rate = targets_rate
+        targets_clip = np.clip(targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        return targets_logit
+
+    def target_graph(self, T, sigma, N, neuron_list, epsilon):
+        targets_clip = np.clip(self.targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        t = self.t
+        plt.figure(figsize=(12, 4))
+        for i, color in zip(neuron_list, colors):
+            plt.plot(t, targets_logit[i], label=f'Neuron {i}', color=color)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Activation')
+        plt.title('Characteristic (boxcar) logit targets')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
 
 
 class Realistic_seq(Gaussian_seq):
