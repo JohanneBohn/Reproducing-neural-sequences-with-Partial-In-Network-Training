@@ -225,13 +225,13 @@ class PINning:
         plt.show()
 
     def simulate(self, inputs, n_steps):
-        all_rates = []
+        total = None
         for _ in range(n_steps):
             self.rnn.x = np.random.randn(self.rnn.N) * 0.1
             self.rnn.r = self.rnn.sigm(self.rnn.x)
             rates = self.rnn.run(inputs)
-            all_rates.append(rates)
-        return np.mean(all_rates, axis=0)
+            total = rates.copy() if total is None else total + rates
+        return total / n_steps
 
     def display_simulation(self, T, dt, rates, neuron_list):
         norm_rates = Metrics.normalize(rates)

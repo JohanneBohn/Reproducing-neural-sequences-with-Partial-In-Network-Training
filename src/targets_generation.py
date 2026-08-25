@@ -192,6 +192,65 @@ class Indicator_seq(Gaussian_seq):
         plt.show()
 
 
+class Grid_cells_seq(Gaussian_seq):
+    """
+    Generates sequences where every neuron fires three times, at the same fixed instants (tCOM = 3, 6 and 9 s),
+    each occurrence with a random peak height (amp_range), and a width porportional to it.
+    """
+    def __init__(self, T, dt, tCOM_list):
+        super().__init__(T, dt)
+        self.activations = None
+        self.targets_rate = None
+        self.tCOM = tCOM_list
+
+    def _get_amplitude_list(self, n, amp_range):
+        return [random.uniform(*amp_range) for _ in range(n)]
+
+    def target_functions(self, T, sigma, N, epsilon, amp_range=(0.2, 1.0)):
+        n_bumps = len(self.tCOM)
+        self.amplitudes = [self._get_amplitude_list(n_bumps, amp_range) for _ in range(N)]
+        self.activations = [list(self.tCOM) for _ in range(N)]
+
+        targets_rate = np.array([
+            np.max([
+                amp * self.gaussian(sigma * amp, t_center=tc)
+                for tc, amp in zip(self.tCOM, amps)
+            ], axis=0)
+            for amps in self.amplitudes
+        ])
+        self.targets_rate = targets_rate
+        targets_clip = np.clip(targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        return targets_logit
+
+    def gaussian_graph(self, T, sigma, N, neuron_list):
+        t = self.t
+        plt.figure(figsize=(12, 4))
+        for i, color in zip(neuron_list, colors):
+            plt.plot(t, self.targets_rate[i], label=f'Neuron {i}', color=color)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Activation')
+        plt.title('Grid cells targets')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def target_graph(self, T, sigma, N, neuron_list, epsilon):
+        targets_clip = np.clip(self.targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        t = self.t
+        plt.figure(figsize=(12, 4))
+        for i, color in zip(neuron_list, colors):
+            plt.plot(t, targets_logit[i], label=f'Neuron {i}', color=color)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Activation')
+        plt.title('Grid cells logit targets')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
+
 class Realistic_seq(Gaussian_seq):
     """
     Generates sequences with properties similar to the unavailable training data of Rajan, Harvey & Tank (2016):
