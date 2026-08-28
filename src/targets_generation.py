@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+from scipy.ndimage import gaussian_filter1d
 
 colors = ['#472A7A', '#375A8C', '#26828E', '#22A884', '#63CB5F', '#CAE11F']
 
@@ -250,12 +251,95 @@ class Grid_cells_seq(Gaussian_seq):
         plt.show()
 
 
-
 class Realistic_seq(Gaussian_seq):
     """
     Generates sequences with properties similar to the unavailable training data of Rajan, Harvey & Tank (2016):
     - each neuron fires transiently once during the trial, at its tCOM (time of center of mass);
     - bVar = 40% (~);
     - non-negative firing rates.
-    Strategy: inject per-neuron variability (width jitter, amplitude jitter, an extra "off-sequence" bump, small rectified noise) to the idealized Gaussian sequences. 
+    Strategy: inject per-neuron variability (width jitter, amplitude jitter, colored rectified noise) to the idealized Gaussian sequences.
     """
+    def __init__(self, T, dt, seed=42):
+        super().__init__(T, dt)
+        self.rng = np.random.default_rng(seed)
+        self.t_centers = None
+        self.targets_rate = None
+
+    def _colored_noise(self, noise_tau):
+        raw = self.rng.standard_normal(self.t.shape)
+        sigma_samples = max(noise_tau / self.dt, 1e-9)
+        smoothed = gaussian_filter1d(raw, sigma=sigma_samples)
+        smoothed = smoothed / (smoothed.std() + 1e-9)
+        return np.abs(smoothed)
+
+    def realistic_gaussian(self, sigma, t_center, 
+                           width_jitter, amp_jitter, 
+                           noise_level, noise_tau, noise_floor, 
+                           baseline_frac, baseline_range
+                           ):
+        width = sigma * np.exp(self.rng.normal(0, width_jitter))
+        amp   = np.exp(self.rng.normal(0, amp_jitter))
+        trace = amp * self.gaussian(width, t_center)
+        if self.rng.uniform() < baseline_frac:
+            trace = trace + self.rng.uniform(*baseline_range) * amp
+        envelope = trace + noise_floor * amp
+        trace = trace + noise_level * envelope * self._colored_noise(noise_tau)
+        trace = np.clip(trace, 0, None)
+        return trace
+
+    def target_functions(self, T, sigma, N, epsilon, 
+                         width_jitter=0.20, amp_jitter=0.10, 
+                         noise_level=0.03, noise_tau=0.3, noise_floor=0.15, 
+                         baseline_frac=0.3, baseline_range=(0.1, 0.4)
+                         ):
+        t_centers = np.sort(self.rng.uniform(0, T, N))
+        targets_rate = np.array([
+            self.realistic_gaussian(sigma, tc, width_jitter, amp_jitter, noise_level, noise_tau, noise_floor,
+                                     baseline_frac, baseline_range)
+            for tc in t_centers
+        ])
+        scale = np.percentile(targets_rate.max(axis=1), 99) + 1e-9
+        targets_rate = np.clip(targets_rate / scale, 0, None)
+        self.t_centers = t_centers
+        self.targets_rate = targets_rate
+        targets_clip = np.clip(targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        return targets_logit
+
+    def gaussian_graph(self, T, sigma, N, neuron_list):
+        t = self.t
+        plt.figure(figsize=(12, 4))
+        for i, color in zip(neuron_list, colors):
+            plt.plot(t, self.targets_rate[i], label=f'Neuron {i}', color=color)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Activation')
+        plt.title('Realistic targets')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def target_graph(self, T, sigma, N, neuron_list, epsilon):
+        targets_clip = np.clip(self.targets_rate, epsilon, 1 - epsilon)
+        targets_logit = np.log(targets_clip / (1 - targets_clip))
+        t = self.t
+        plt.figure(figsize=(12, 4))
+        for i, color in zip(neuron_list, colors):
+            plt.plot(t, targets_logit[i], label=f'Neuron {i}', color=color)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Activation')
+        plt.title('Realistic logit targets')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def sequence_graph(self):
+        order = np.argsort(self.t_centers)
+        T = self.t[-1] + (self.t[1] - self.t[0])
+        plt.figure(figsize=(10, 5))
+        plt.imshow(self.targets_rate[order], aspect='auto', extent=[0, T, len(order), 0], cmap='viridis')
+        plt.colorbar()
+        plt.xlabel('Time (s)')
+        plt.ylabel('Neuron # (sorted by tCOM)')
+        plt.title('Realistic sequence (sorted by tCOM)')
+        plt.tight_layout()
+        plt.show()
