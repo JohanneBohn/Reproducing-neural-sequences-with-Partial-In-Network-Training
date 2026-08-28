@@ -371,7 +371,7 @@ def _pgd_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv_
 
 
 @njit(cache=True, fastmath=True)
-def _bptt_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, eta, eta_decay, lam, K):
+def _bptt_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv_threshold, x_init_scale, eta, eta_decay, lam, K, clip_norm):
     """
     Truncated backpropagation-through-time (BPTT), projected at every weight update onto the Dale's-law sign constraint.
 
@@ -397,6 +397,7 @@ def _bptt_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv
 
     for run in range(n_runs):
         eta_run = eta / (1.0 + eta_decay * run)
+        run_max_grad_norm = 0.0
 
         for i in range(N):
             x[i] = np.random.standard_normal() * x_init_scale
@@ -457,6 +458,21 @@ def _bptt_train(J, x, plastic, sign, theta, dt, tau, inputs, targets, n_runs, cv
                     rj = r_hist[k, j]
                     Dj = rj * (1.0 - rj)
                     delta[j] = (1.0 - dt / tau) * delta[j] + Dj * Jt_eff[j]
+
+            # gradient clipping:
+            gnorm_sq = 0.0
+            for i in range(N):
+                for b in range(pN):
+                    gnorm_sq += grad[i, b] * grad[i, b]
+            gnorm = gnorm_sq ** 0.5
+            if gnorm > run_max_grad_norm:
+                run_max_grad_norm = gnorm
+
+            if clip_norm > 0.0 and gnorm > clip_norm:
+                scale = clip_norm / (gnorm + 1e-8)
+                for i in range(N):
+                    for b in range(pN):
+                        grad[i, b] *= scale
 
             # apply the projected accumulated gradient:
             for i in range(N):
@@ -649,10 +665,10 @@ class Dale_PINning(PINning):
                 self.rnn.J[:, j] = -np.abs(self.rnn.J[:, j])
         self.rnn.J_init = self.rnn.J.copy()
 
-    def set_dale_constraint_mixed(self, p_exc):
+    def set_dale_constraint_mixed(self, p_exc, p_exc_plastic):
         """
-        Applies Dale's principle to all N neurons,
-        while ensuring that the E/I proportion p_exc is implemented in the plastic sub-sample.
+        Applies Dale's principle to all N neurons according to the proportion p_exc,
+        while ensuring that the E/I proportion p_exc_plastic is implemented in the plastic sub-sample.
         """
         N = self.rnn.N
         pN = self.pN
@@ -662,7 +678,7 @@ class Dale_PINning(PINning):
 
         global_sign = np.empty(N, dtype=np.int64)
 
-        n_exc_plastic = int(round(p_exc * pN))
+        n_exc_plastic = int(round(p_exc_plastic * pN))
         sign_plastic = -np.ones(pN, dtype=np.int64)
         exc_plastic = np.random.choice(pN, n_exc_plastic, replace=False)
         sign_plastic[exc_plastic] = 1
@@ -744,7 +760,7 @@ class Dale_PINning(PINning):
 
         return errors, j_norms
 
-    def train_dale_bptt(self, inputs, n_runs, eta, cv_threshold, K=200, lam=0.0, eta_decay=0.0, DEBUG=False, x_init_scale=0.1):
+    def train_dale_bptt(self, inputs, n_runs, eta, cv_threshold, K=200, lam=0.0, eta_decay=0.0, DEBUG=False, x_init_scale=0.1, clip_norm=None):
         """
         Truncated backpropagation-through-time (BPTT), projected at every weight update onto the Dale's-law sign constraint.
 
@@ -761,9 +777,11 @@ class Dale_PINning(PINning):
         plastic = np.ascontiguousarray(self.plastic_neurons, dtype=np.int64)
         sign = np.ascontiguousarray(self.sign, dtype=np.int64)
 
+        clip_val = float(clip_norm) if clip_norm is not None else -1.0
+
         errors, j_norms = _bptt_train(
             self.rnn.J, x, plastic, sign, float(self.rnn.theta), float(self.rnn.dt), float(self.rnn.tau),
-            inputs, targets, int(n_runs), float(cv_threshold), float(x_init_scale), float(eta), float(eta_decay), float(lam), int(K)
+            inputs, targets, int(n_runs), float(cv_threshold), float(x_init_scale), float(eta), float(eta_decay), float(lam), int(K), clip_val
         )
         self.rnn.x = x
         self.rnn.r = self.rnn.sigm(self.rnn.x)
@@ -785,6 +803,7 @@ class Dale_PINning(PINning):
         self.last_cv_threshold = cv_threshold
         self.last_n_runs = len(errors)
         self.last_K = K
+        self.last_clip_norm = clip_norm
 
         return errors, j_norms
 
